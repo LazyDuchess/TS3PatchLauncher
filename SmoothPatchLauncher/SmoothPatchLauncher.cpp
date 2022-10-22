@@ -12,6 +12,15 @@
 #include <Psapi.h>
 #include <TlHelp32.h>
 
+#include <ShlObj.h>    // Shell API
+#include <Propkey.h>   // PKEY_* constants
+#include <atlbase.h>   // CComPtr, CComHeapPtr
+#include <io.h>
+#include <fcntl.h>
+#include <string>
+#include <system_error>
+#include "config.h"
+#include "filesys.h"
 
 //#define CONSOLE
 
@@ -43,15 +52,63 @@ VOID startup(LPCTSTR lpApplicationName)
     CloseHandle(pi.hThread);
 }
 
+// Wrapper for SHCreateItemFromParsingName(), IShellItem2::GetString()
+// Throws std::system_error in case of any error.
+std::wstring GetShellPropStringFromPath(LPCWSTR pPath, PROPERTYKEY const& key)
+{
+    // Use CComPtr to automatically release the IShellItem2 interface when the function returns
+    // or an exception is thrown.
+    CComPtr<IShellItem2> pItem;
+    HRESULT hr = SHCreateItemFromParsingName(pPath, nullptr, IID_PPV_ARGS(&pItem));
+    if (FAILED(hr))
+        throw std::system_error(hr, std::system_category(), "SHCreateItemFromParsingName() failed");
 
+    // Use CComHeapPtr to automatically release the string allocated by the shell when the function returns
+    // or an exception is thrown (calls CoTaskMemFree).
+    CComHeapPtr<WCHAR> pValue;
+    hr = pItem->GetString(key, &pValue);
+    if (FAILED(hr))
+        throw std::system_error(hr, std::system_category(), "IShellItem2::GetString() failed");
 
-#ifndef   CONSOLE
+    // Copy to wstring for convenience
+    return std::wstring(pValue);
+}
+
+std::wstring gameName = L"TS3.exe";
+std::wstring launcherName = L"Sims3Launcher.exe";
+std::wstring launcherDesc = L"Sims3Launcher";
+std::wstring platformName = L"EADesktop.exe";
+
+#ifndef CONSOLE
 int WinMain(HINSTANCE hInst, HINSTANCE hInstPrev, PSTR cmdline, int cmdshow)
 #endif
 #ifdef CONSOLE
 int main()
 #endif
 {
+    CoInitialize(nullptr);
+
+    bool cfgResult = false;
+
+    ConfigObject config = ConfigObject(FileSys::GetAbsolutePathAuto(L"TS3PatchLauncher.cfg"), cfgResult);
+
+    if (cfgResult)
+    {
+        gameName = config.GetWString(L"GameName", gameName);
+        launcherName = config.GetWString(L"LauncherName", launcherName);
+        launcherDesc = config.GetWString(L"LauncherDescription", launcherDesc);
+        platformName = config.GetWString(L"PlatformName", platformName);
+    }
+
+    bool launcherIsGame = false;
+    bool managedbyLauncher = false;
+    int nArgs;
+    LPWSTR *argList = CommandLineToArgvW(GetCommandLine(),&nArgs);
+    for (int i = 0; i < nArgs; i++)
+    {
+        if (wcscmp(argList[i], L"-launcher") == 0)
+            managedbyLauncher = true;
+    }
     unsigned int i;
     DWORD aProcesses[1024], cbNeeded, cProcesses;
     wchar_t modName[MAX_PATH];
@@ -61,10 +118,24 @@ int main()
     wchar_t wcs[MAX_PATH];
     wchar_t dllPath[MAX_PATH];
     wchar_t launcherPath[MAX_PATH];
+
     wcscpy_s(wcs, folder.c_str());
-    wcscat_s(wcs, L"\\TS3.exe");
+    wcscat_s(wcs, L"\\");
+    wcscat_s(wcs, gameName.c_str());
+
     wcscpy_s(launcherPath, folder.c_str());
-    wcscat_s(launcherPath, L"\\Sims3Launcher.exe");
+    wcscat_s(launcherPath, L"\\");
+    wcscat_s(launcherPath, launcherName.c_str());
+
+        std::wstring launcherDesc = GetShellPropStringFromPath(launcherPath, PKEY_FileDescription);
+        wprintf(launcherDesc.c_str());
+        if (wcscmp(launcherDesc.c_str(), launcherDesc.c_str()) != 0)
+        {
+            launcherIsGame = true;
+            wprintf(L"Launcher is game!");
+        }
+        else
+            wprintf(L"Launcher is not game.");
     GetFullPathName(L"TS3Patch.asi", MAX_PATH, dllPath, NULL);
     bool gameRunning = false;
     if (EnumProcesses(aProcesses, sizeof(aProcesses), &cbNeeded))
@@ -94,7 +165,7 @@ int main()
                         {
                             TerminateProcess(hProcess, 1);
                         }
-                        if (!wcscmp(szProcessName, L"TS3.exe") || !wcscmp(szProcessName, L"TS3W.exe") || !wcscmp(szProcessName, L"Sims3Launcher.exe"))
+                        if (!wcscmp(szProcessName, gameName.c_str()) /* || !wcscmp(szProcessName, L"TS3W.exe")*/ || !wcscmp(szProcessName, launcherName.c_str()))
                             gameRunning = true;
                     }
                 }
@@ -113,6 +184,10 @@ int main()
     bool gameOpenThisTick = false;
     bool launcherOpenThisTick = false;
     bool originOpenThisTick = false;
+
+    if (managedbyLauncher)
+        launcherOpen = true;
+
     std::wstring pattern(L"*.asi");
     WIN32_FIND_DATA data;
     HANDLE hFind;
@@ -161,11 +236,11 @@ int main()
                             GetModuleBaseName(hProcess, hMod, szProcessName,
                                 sizeof(szProcessName) / sizeof(TCHAR));
                             HANDLE hand;
-                            if (!wcscmp(szProcessName, L"Sims3Launcher.exe"))
+                            if (!wcscmp(szProcessName, launcherName.c_str()))
                             {
-                                if (!launcherOpen)
+                                if (!launcherOpen && !managedbyLauncher && launcherIsGame)
                                 {
-                                    Sleep(1000);
+                                    Sleep(100);
                                     for (n = 0; n < v.size(); n++)
                                     {
 
@@ -181,11 +256,11 @@ int main()
                                 launcherOpen = true;
                                 launcherOpenThisTick = true;
                             }
-                            if (!wcscmp(szProcessName, L"TS3.exe") || !wcscmp(szProcessName, L"TS3W.exe"))
+                            if (!wcscmp(szProcessName, gameName.c_str())/* || !wcscmp(szProcessName, L"TS3W.exe")*/)
                             {
                                 if (!gameOpen)
                                 {
-                                    Sleep(1000);
+                                    Sleep(100);
                                     
                                     for (n = 0; n < v.size(); n++)
                                     {
@@ -205,7 +280,7 @@ int main()
                                 gameOpen = true;
                                 gameOpenThisTick = true;
                             }
-                            if (!wcscmp(szProcessName, L"Origin.exe"))
+                            if (!wcscmp(szProcessName, platformName.c_str()))
                             {
                                 originOpen = true;
                                 originOpenThisTick = true;
@@ -220,13 +295,15 @@ int main()
         }
         if (originOpen)
         {
+            if (!gameOpenThisTick)
+                gameOpen = false;
             if (!originOpenThisTick)
                 return 0;
             if (!launcherOpenThisTick && launcherAndGameOpened == false && launcherOpen == true)
             {
                 return 0;
             }
-            if (!gameOpenThisTick && launcherAndGameOpened == true)
+            if (!gameOpenThisTick && !launcherOpenThisTick && launcherAndGameOpened == true)
             {
                 return 0;
             }
